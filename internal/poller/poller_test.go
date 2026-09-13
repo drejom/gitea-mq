@@ -20,6 +20,20 @@ func setupPollerTest(t *testing.T) (*poller.Deps, *gitea.MockClient, *queue.Serv
 	svc, ctx, repoID := testutil.TestQueueService(t)
 
 	mock := &gitea.MockClient{}
+	mock.GetPRFn = func(ctx context.Context, owner, repo string, index int64) (*gitea.PR, error) {
+		if mock.ListOpenPRsFn != nil {
+			prs, err := mock.ListOpenPRsFn(ctx, owner, repo)
+			if err != nil {
+				return nil, err
+			}
+			for i := range prs {
+				if prs[i].Index == index {
+					return &prs[i], nil
+				}
+			}
+		}
+		return nil, fmt.Errorf("PR #%d not found", index)
+	}
 	deps := &poller.Deps{
 		Forge:          gitea.NewForge(mock, "https://gitea.example.com"),
 		Queue:          svc,
@@ -49,6 +63,170 @@ func mockAutomergePRs(mock *gitea.MockClient, prs ...gitea.PR) {
 	}
 	mock.GetPRTimelineFn = func(_ context.Context, _, _ string, _ int64) ([]gitea.TimelineComment, error) {
 		return automergeTimeline(), nil
+	}
+}
+
+// Gitea can keep the PR's creation SHA in its list response after a branch
+// deletion/rewrite/reopen, while the single-PR endpoint has the current head.
+// The queue must reject that candidate before testing or reporting success.
+func TestPollOnce_StaleListedHeadRejectsAdmission(t *testing.T) {
+	deps, mock, svc, ctx, repoID := setupPollerTest(t)
+	listed := makePR(733, "f72a2329", "main")
+	current := makePR(733, "c29ba145", "main")
+	mockAutomergePRs(mock, listed)
+	mock.GetPRFn = func(_ context.Context, _, _ string, _ int64) (*gitea.PR, error) {
+		return &current, nil
+	}
+
+	result, err := poller.PollOnce(ctx, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry, _ := svc.GetEntry(ctx, repoID, 733); entry != nil {
+		t.Fatalf("stale list head must not be queued: %+v", entry)
+	}
+	if len(result.Errors) == 0 {
+		t.Fatal("expected an explicit head-mismatch error")
+	}
+	if len(mock.CallsTo("MergeBranches")) != 0 {
+		t.Fatal("stale head must not be tested")
+	}
+	for _, call := range mock.CallsTo("CreateCommitStatus") {
+		status := call.Args[3].(gitea.CommitStatus)
+		if status.State == "success" || call.Args[2] == listed.Head.Sha {
+			t.Fatalf("must not publish a queue status to the stale head: %+v", call)
+		}
+	}
+	if len(mock.CallsTo("CancelAutoMerge")) != 1 || len(mock.CallsTo("CreateComment")) != 1 {
+		t.Fatal("head mismatch must cancel merge intent and explain the rejection")
+	}
+}
+
+func TestPollOnce_RetargetedBeforeAdmissionIsNotAHeadMismatch(t *testing.T) {
+	deps, mock, svc, ctx, repoID := setupPollerTest(t)
+	listed := makePR(733, "same-head", "main")
+	current := makePR(733, "same-head", "release")
+	mockAutomergePRs(mock, listed)
+	mock.GetPRFn = func(_ context.Context, _, _ string, _ int64) (*gitea.PR, error) {
+		return &current, nil
+	}
+
+	result, err := poller.PollOnce(ctx, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry, _ := svc.GetEntry(ctx, repoID, 733); entry != nil {
+		t.Fatalf("retargeted PR must not be queued: %+v", entry)
+	}
+	if len(result.Errors) == 0 || len(mock.CallsTo("CreateComment")) != 0 {
+		t.Fatalf("expected retarget error without head-mismatch comment: %v", result.Errors)
+	}
+}
+
+func TestPollOnce_HeadChangesImmediatelyBeforeTesting(t *testing.T) {
+	deps, mock, svc, ctx, repoID := setupPollerTest(t)
+	listed := makePR(733, "old-head", "main")
+	current := makePR(733, "new-head", "main")
+	mockAutomergePRs(mock, listed)
+	reads := 0
+	mock.GetPRFn = func(_ context.Context, _, _ string, _ int64) (*gitea.PR, error) {
+		reads++
+		if reads <= 2 {
+			return &listed, nil
+		}
+		return &current, nil
+	}
+
+	result, err := poller.PollOnce(ctx, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mock.CallsTo("MergeBranches")) != 0 {
+		t.Fatal("changed head must not be tested")
+	}
+	if entry, _ := svc.GetEntry(ctx, repoID, 733); entry == nil || entry.State != pg.EntryStateQueued {
+		t.Fatalf("candidate must remain queued for next reconciliation: %+v", entry)
+	}
+	if len(result.Errors) == 0 {
+		t.Fatal("expected head-change error")
+	}
+}
+
+func TestPollOnce_HeadChangesDuringFastForwardCheck(t *testing.T) {
+	deps, mock, svc, ctx, repoID := setupPollerTest(t)
+	deps.SkipQueueIfUpToDate = true
+	listed := makePR(733, "old-head", "main")
+	current := makePR(733, "new-head", "main")
+	mockAutomergePRs(mock, listed)
+	reads := 0
+	mock.GetPRFn = func(_ context.Context, _, _ string, _ int64) (*gitea.PR, error) {
+		reads++
+		if reads <= 3 {
+			return &listed, nil
+		}
+		return &current, nil
+	}
+	mock.CompareCommitsFn = func(_ context.Context, _, _, _, _ string) (*gitea.Compare, error) {
+		return &gitea.Compare{TotalCommits: 0}, nil
+	}
+
+	result, err := poller.PollOnce(ctx, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry, _ := svc.GetEntry(ctx, repoID, 733); entry == nil || entry.State != pg.EntryStateQueued {
+		t.Fatalf("stale head must not enter success state: %+v", entry)
+	}
+	for _, call := range mock.CallsTo("CreateCommitStatus") {
+		if call.Args[3].(gitea.CommitStatus).State == "success" {
+			t.Fatal("stale head must not receive success")
+		}
+	}
+	if len(result.Errors) == 0 {
+		t.Fatal("expected head-change error")
+	}
+}
+
+// An existing candidate must be invalidated using a fresh PR read even when
+// Gitea's list projection remains stuck at the original SHA.
+func TestPollOnce_StaleListedHeadRemovesActiveEntry(t *testing.T) {
+	deps, mock, svc, ctx, repoID := setupPollerTest(t)
+	if _, err := svc.Enqueue(ctx, repoID, 733, "f72a2329", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.UpdateState(ctx, repoID, 733, pg.EntryStateTesting); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SetMergeBranch(ctx, repoID, 733, merge.BranchName(733), "candidate"); err != nil {
+		t.Fatal(err)
+	}
+	listed := makePR(733, "f72a2329", "main")
+	current := makePR(733, "c29ba145", "main")
+	mockAutomergePRs(mock, listed)
+	mock.GetPRFn = func(_ context.Context, _, _ string, _ int64) (*gitea.PR, error) {
+		return &current, nil
+	}
+	mock.GetCombinedCommitStatusFn = func(_ context.Context, _, _, _ string) (*gitea.CombinedStatus, error) {
+		return &gitea.CombinedStatus{Statuses: []gitea.CommitStatusResult{{Context: "ci/build", Status: "success"}}}, nil
+	}
+
+	result, err := poller.PollOnce(ctx, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry, _ := svc.GetEntry(ctx, repoID, 733); entry != nil {
+		t.Fatalf("stale candidate must be dequeued: %+v", entry)
+	}
+	if len(result.Dequeued) != 1 || result.Dequeued[0] != 733 {
+		t.Fatalf("expected PR #733 dequeued, got %v", result.Dequeued)
+	}
+	if len(mock.CallsTo("CancelAutoMerge")) != 1 || len(mock.CallsTo("CreateComment")) != 1 {
+		t.Fatal("head change must cancel merge intent and explain the rejection")
+	}
+	for _, call := range mock.CallsTo("CreateCommitStatus") {
+		if call.Args[3].(gitea.CommitStatus).State == "success" {
+			t.Fatal("stale candidate must not publish success")
+		}
 	}
 }
 
@@ -205,7 +383,17 @@ func (tc reconcileCase) run(t *testing.T) {
 	}
 
 	mock.ListOpenPRsFn = func(_ context.Context, _, _ string) ([]gitea.PR, error) { return tc.openPRs, nil }
-	mock.GetPRFn = func(_ context.Context, _, _ string, _ int64) (*gitea.PR, error) { return tc.getPR, nil }
+	mock.GetPRFn = func(_ context.Context, _, _ string, _ int64) (*gitea.PR, error) {
+		if tc.getPR != nil {
+			return tc.getPR, nil
+		}
+		for i := range tc.openPRs {
+			if tc.openPRs[i].Index == 42 {
+				return &tc.openPRs[i], nil
+			}
+		}
+		return nil, fmt.Errorf("PR #42 not found")
+	}
 	mock.GetPRTimelineFn = func(_ context.Context, _, _ string, _ int64) ([]gitea.TimelineComment, error) {
 		return tc.timeline, nil
 	}

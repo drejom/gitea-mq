@@ -155,15 +155,10 @@ func PollOnce(ctx context.Context, deps *Deps) (*PollResult, error) {
 		return &PollResult{Paused: true, Errors: []error{err}}, nil
 	}
 
-	openPRMap := make(map[int64]*forge.PR, len(openPRs))
-	for i := range openPRs {
-		openPRMap[openPRs[i].Number] = &openPRs[i]
-	}
-
 	enqueueAutoMergePRs(ctx, deps, result, openPRs)
 	enqueueLabeledPRs(ctx, deps, result, openPRs)
 	hintStackedPRs(ctx, deps, openPRs)
-	reconcileEntries(ctx, deps, result, openPRMap)
+	reconcileEntries(ctx, deps, result)
 	startQueuedHeads(ctx, deps, result)
 	pollMergeBranchChecks(ctx, deps, result)
 
@@ -296,7 +291,29 @@ func enqueueAutoMergePRs(ctx context.Context, deps *Deps, result *PollResult, op
 
 // enqueuePR adds a PR to the queue for targetBranch once its own CI is green.
 func enqueuePR(ctx context.Context, deps *Deps, result *PollResult, pr *forge.PR, targetBranch, source string) {
-	res, err := prCheckResult(ctx, deps, pr, targetBranch)
+	current, err := deps.Forge.GetPR(ctx, deps.Owner, deps.Repo, pr.Number)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Errorf("get current PR #%d before enqueue: %w", pr.Number, err))
+		return
+	}
+	if current == nil {
+		result.Errors = append(result.Errors, fmt.Errorf("PR #%d disappeared before enqueue", pr.Number))
+		return
+	}
+	if current.State != "open" || current.HeadSHA == "" {
+		result.Errors = append(result.Errors, fmt.Errorf("PR #%d is not an open PR with a head commit", pr.Number))
+		return
+	}
+	if current.HeadSHA != pr.HeadSHA {
+		rejectStaleListedPR(ctx, deps, result, pr, current)
+		return
+	}
+	if current.BaseBranch != pr.BaseBranch {
+		result.Errors = append(result.Errors, fmt.Errorf("PR #%d target branch changed from %s to %s during enqueue", pr.Number, pr.BaseBranch, current.BaseBranch))
+		return
+	}
+
+	res, err := prCheckResult(ctx, deps, current, targetBranch)
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Errorf("check CI status for PR #%d: %w", pr.Number, err))
 		return
@@ -305,7 +322,7 @@ func enqueuePR(ctx context.Context, deps *Deps, result *PollResult, pr *forge.PR
 		return
 	}
 
-	enqResult, err := deps.Queue.Enqueue(ctx, deps.RepoID, pr.Number, pr.HeadSHA, targetBranch)
+	enqResult, err := deps.Queue.Enqueue(ctx, deps.RepoID, pr.Number, current.HeadSHA, targetBranch)
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Errorf("enqueue PR #%d: %w", pr.Number, err))
 		return
@@ -314,7 +331,7 @@ func enqueuePR(ctx context.Context, deps *Deps, result *PollResult, pr *forge.PR
 	if enqResult.IsNew {
 		desc := fmt.Sprintf("Queued (position #%d)", enqResult.Position)
 		targetURL := forge.DashboardPRURL(deps.ExternalURL, deps.Forge.Kind(), deps.Owner, deps.Repo, pr.Number)
-		if err := deps.Forge.SetMQStatus(ctx, deps.Owner, deps.Repo, pr.HeadSHA, forge.MQStatus{
+		if err := deps.Forge.SetMQStatus(ctx, deps.Owner, deps.Repo, current.HeadSHA, forge.MQStatus{
 			State: pg.CheckStatePending, Description: desc, TargetURL: targetURL,
 		}); err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("set pending status for PR #%d: %w", pr.Number, err))
@@ -322,6 +339,28 @@ func enqueuePR(ctx context.Context, deps *Deps, result *PollResult, pr *forge.PR
 
 		result.Enqueued = append(result.Enqueued, pr.Number)
 		slog.Info("enqueued PR from "+source, "pr", pr.Number, "position", enqResult.Position)
+	}
+}
+
+// A stale list projection must not become a queue candidate. In particular,
+// Gitea can retain the creation SHA after a branch rewrite and PR reopen.
+func rejectStaleListedPR(ctx context.Context, deps *Deps, result *PollResult, listed, current *forge.PR) {
+	msg := fmt.Sprintf("PR #%d head mismatch: list=%s current=%s; merge intent withdrawn", listed.Number, listed.HeadSHA, current.HeadSHA)
+	result.Errors = append(result.Errors, fmt.Errorf("%s", msg))
+	if current.HeadSHA != "" {
+		targetURL := forge.DashboardPRURL(deps.ExternalURL, deps.Forge.Kind(), deps.Owner, deps.Repo, listed.Number)
+		if err := deps.Forge.SetMQStatus(ctx, deps.Owner, deps.Repo, current.HeadSHA, forge.MQStatus{
+			State: pg.CheckStateError, Description: "PR head changed; re-schedule merge", TargetURL: targetURL,
+		}); err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("set head-mismatch status for PR #%d: %w", listed.Number, err))
+		}
+	}
+	if err := forge.CancelMergeIntent(ctx, deps.Forge, deps.Owner, deps.Repo, listed.Number, deps.MergeLabel); err != nil {
+		result.Errors = append(result.Errors, fmt.Errorf("cancel stale merge intent for PR #%d: %w", listed.Number, err))
+	}
+	if err := deps.Forge.Comment(ctx, deps.Owner, deps.Repo, listed.Number,
+		"⚠️ Removed from merge queue: Gitea reports different PR heads in its list and detail responses. Re-schedule only after the PR head is consistent."); err != nil {
+		result.Errors = append(result.Errors, fmt.Errorf("comment on stale PR #%d: %w", listed.Number, err))
 	}
 }
 
@@ -451,7 +490,7 @@ func finalizeLabeledMerge(ctx context.Context, deps *Deps, result *PollResult, e
 
 // reconcileEntries removes queue entries whose PR was merged, closed,
 // retargeted, pushed to, or had auto-merge cancelled.
-func reconcileEntries(ctx context.Context, deps *Deps, result *PollResult, openPRMap map[int64]*forge.PR) {
+func reconcileEntries(ctx context.Context, deps *Deps, result *PollResult) {
 	activeEntries, err := deps.Queue.ListActiveEntries(ctx, deps.RepoID)
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Errorf("list active entries: %w", err))
@@ -459,16 +498,17 @@ func reconcileEntries(ctx context.Context, deps *Deps, result *PollResult, openP
 	}
 
 	for _, entry := range activeEntries {
-		pr, isOpen := openPRMap[entry.PrNumber]
-		if !isOpen {
-			// PR no longer in the open list: fetch directly to learn merged/closed.
-			fullPR, err := deps.Forge.GetPR(ctx, deps.Owner, deps.Repo, entry.PrNumber)
-			if err != nil {
-				result.Errors = append(result.Errors, fmt.Errorf("get PR #%d: %w", entry.PrNumber, err))
-				continue
-			}
-			pr = fullPR
+		// The list projection can be stale even while the PR remains open.
+		pr, err := deps.Forge.GetPR(ctx, deps.Owner, deps.Repo, entry.PrNumber)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("get current PR #%d: %w", entry.PrNumber, err))
+			continue
 		}
+		if pr == nil {
+			result.Errors = append(result.Errors, fmt.Errorf("PR #%d disappeared during reconciliation", entry.PrNumber))
+			continue
+		}
+		isOpen := pr.State == "open"
 
 		labeled := deps.MergeLabel != "" && pr.HasLabel(deps.MergeLabel)
 		retargeted := pr.BaseBranch != "" && pr.BaseBranch != entry.TargetBranch
@@ -653,6 +693,15 @@ func startQueuedHeads(ctx context.Context, deps *Deps, result *PollResult) {
 		if head == nil || head.State != pg.EntryStateQueued {
 			continue
 		}
+		current, err := deps.Forge.GetPR(ctx, deps.Owner, deps.Repo, head.PrNumber)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("get current PR #%d before testing: %w", head.PrNumber, err))
+			continue
+		}
+		if current == nil || current.State != "open" || current.HeadSHA != head.PrHeadSha {
+			result.Errors = append(result.Errors, fmt.Errorf("PR #%d head changed before testing; candidate withheld", head.PrNumber))
+			continue
+		}
 
 		// The batch engine handles up-to-date heads itself (SkipIfUpToDate).
 		if deps.Batch.Enabled() {
@@ -693,6 +742,15 @@ func tryFastForwardSuccess(ctx context.Context, deps *Deps, result *PollResult, 
 	}
 	if !upToDate {
 		return false
+	}
+	current, err := deps.Forge.GetPR(ctx, deps.Owner, deps.Repo, head.PrNumber)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Errorf("get current PR #%d before fast-forward success: %w", head.PrNumber, err))
+		return true
+	}
+	if current == nil || current.State != "open" || current.HeadSHA != head.PrHeadSha {
+		result.Errors = append(result.Errors, fmt.Errorf("PR #%d head changed before fast-forward success; candidate withheld", head.PrNumber))
+		return true
 	}
 
 	targetURL := forge.DashboardPRURL(deps.ExternalURL, deps.Forge.Kind(), deps.Owner, deps.Repo, head.PrNumber)
