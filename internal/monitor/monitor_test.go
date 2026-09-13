@@ -2,6 +2,7 @@ package monitor_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,12 @@ func setupMonitorTest(t *testing.T) (*monitor.Deps, *gitea.MockClient, *queue.Se
 	svc, ctx, repoID := testutil.TestQueueService(t)
 
 	mock := &gitea.MockClient{}
+	mock.GetPRFn = func(_ context.Context, _, _ string, index int64) (*gitea.PR, error) {
+		if index != 42 {
+			return nil, fmt.Errorf("PR #%d not found", index)
+		}
+		return &gitea.PR{Index: 42, State: "open", Head: &gitea.PRRef{Sha: "sha42"}}, nil
+	}
 	deps := &monitor.Deps{
 		Forge:        gitea.NewForge(mock, "https://gitea.example.com"),
 		Queue:        svc,
@@ -63,6 +70,29 @@ func TestProcessCheckStatus_AllPass_TriggersSuccess(t *testing.T) {
 	entry, _ = svc.GetEntry(ctx, repoID, 42)
 	if entry == nil || entry.State != pg.EntryStateSuccess {
 		t.Fatal("entry should be in success state, not removed")
+	}
+}
+
+// A webhook can arrive between polls after the PR head changes. Even if the
+// old candidate's checks pass, it must never release the gate on that SHA.
+func TestProcessCheckStatus_ChangedHeadNeverReportsSuccess(t *testing.T) {
+	deps, mock, svc, ctx, repoID := setupMonitorTest(t)
+	withBranchProtection(mock, "gitea-mq", "ci/build")
+	entry := testutil.EnqueueTesting(t, svc, repoID, 42, "f72a2329", "candidate")
+	mock.GetPRFn = func(_ context.Context, _, _ string, _ int64) (*gitea.PR, error) {
+		return &gitea.PR{Index: 42, State: "open", Head: &gitea.PRRef{Sha: "c29ba145"}}, nil
+	}
+
+	err := monitor.ProcessCheckStatus(ctx, deps, entry, "ci/build", pg.CheckStateSuccess, "")
+	if err == nil || !strings.Contains(err.Error(), "head changed") {
+		t.Fatalf("expected explicit head-change rejection, got %v", err)
+	}
+	if len(mock.CallsTo("CreateCommitStatus")) != 0 {
+		t.Fatal("must not report success on the stale head")
+	}
+	stored, _ := svc.GetEntry(ctx, repoID, 42)
+	if stored == nil || stored.State != pg.EntryStateTesting {
+		t.Fatalf("entry must not enter success state: %+v", stored)
 	}
 }
 

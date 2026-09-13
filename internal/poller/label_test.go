@@ -2,6 +2,7 @@ package poller_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -16,6 +17,20 @@ func setupLabelTest(t *testing.T) (*poller.Deps, *forge.MockForge, *queue.Servic
 	t.Helper()
 	svc, ctx, repoID := testutil.TestQueueService(t)
 	mock := &forge.MockForge{}
+	mock.GetPRFn = func(ctx context.Context, owner, repo string, number int64) (*forge.PR, error) {
+		if mock.ListOpenPRsFn != nil {
+			prs, err := mock.ListOpenPRsFn(ctx, owner, repo)
+			if err != nil {
+				return nil, err
+			}
+			for i := range prs {
+				if prs[i].Number == number {
+					return &prs[i], nil
+				}
+			}
+		}
+		return nil, fmt.Errorf("PR #%d not found", number)
+	}
 	deps := &poller.Deps{
 		Forge:      mock,
 		Queue:      svc,

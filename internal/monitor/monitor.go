@@ -149,6 +149,17 @@ func CheckTimeout(entry *pg.QueueEntry, timeout time.Duration) bool {
 // Sets gitea-mq to success, deletes the merge branch, transitions to success state.
 // Does NOT advance — the poller confirms the PR is actually merged first.
 func HandleSuccess(ctx context.Context, deps *Deps, entry *pg.QueueEntry) error {
+	current, err := deps.Forge.GetPR(ctx, deps.Owner, deps.Repo, entry.PrNumber)
+	if err != nil {
+		return fmt.Errorf("get current PR #%d before success: %w", entry.PrNumber, err)
+	}
+	if current == nil || current.State != "open" || current.HeadSHA != entry.PrHeadSha {
+		currentSHA := ""
+		if current != nil {
+			currentSHA = current.HeadSHA
+		}
+		return fmt.Errorf("PR #%d head changed from %s to %s; refusing success status", entry.PrNumber, entry.PrHeadSha, currentSHA)
+	}
 	slog.Info("all checks passed", "pr", entry.PrNumber)
 
 	targetURL := forge.DashboardPRURL(deps.ExternalURL, deps.Forge.Kind(), deps.Owner, deps.Repo, entry.PrNumber)
